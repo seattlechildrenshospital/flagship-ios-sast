@@ -1,0 +1,240 @@
+# .github/workflows/gemini-analysis.yml
+
+name: Gemini Code Analysis
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  # Required for actions/checkout to fetch code
+  contents: read
+  # Required for github/codeql-action/upload-sarif to upload SARIF results
+  security-events: write
+
+jobs:
+  # This workflow contains a single job called "static-analysis"
+  static-analysis:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # 1. Check out the repository's code so the action can access it
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python, which we will use to script the analysis process
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      # 3. Install the 'requests' library to make HTTP calls to the Gemini API
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      # 4. Run the main analysis script
+      - name: Run Gemini Code Analysis
+        env:
+          # Pass the Google API Key from GitHub secrets to the script
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          # Use a 'heredoc' to create the Python script on the runner.
+          # This makes the workflow self-contained and doesn't require a script in the repo.
+          cat << 'EOF' > analyze.py
+          import os
+          import requests
+          import json
+          import sys
+          import re
+          import time
+
+          # --- Configuration ---
+          API_KEY = os.environ.get("GOOGLE_API_KEY")
+          API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={API_KEY}"
+          
+          # Add or remove file extensions you want to analyze
+          FILE_EXTENSIONS_TO_ANALYZE = [
+              '.swift'
+          ]
+          # Files or directories to ignore to avoid analyzing dependencies or build artifacts
+          IGNORE_PATTERNS = ['.git/', '/.github/', 'node_modules/', '.vscode/', 'dist/', 'build/']
+
+          # --- Main SARIF Structure ---
+          # This is the template for our final SARIF report.
+          # We will add all findings from all files into the 'results' array.
+          sarif_log = {
+              "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
+              "version": "2.1.0",
+              "runs": [
+                  {
+                      "tool": {
+                          "driver": {
+                              "name": "Gemini Static Analyzer",
+                              "informationUri": "https://ai.google.dev/",
+                              "rules": []
+                          }
+                      },
+                      "results": []
+                  }
+              ]
+          }
+
+          def should_ignore(path):
+              """Check if a file or directory path should be ignored."""
+              for pattern in IGNORE_PATTERNS:
+                  if pattern in path:
+                      return True
+              return False
+
+          def create_prompt(file_path, file_content):
+              """Creates the detailed prompt for the Gemini API."""
+              return (
+                  "Perform a static code analysis on the following code file. "
+                  "Identify security vulnerabilities only. "
+                  "Your response MUST be a single, valid JSON object formatted according to the SARIF v2.1.0 standard. "
+                  "The JSON object should represent a complete SARIF log with one 'run' containing the 'results' for this file. "
+                  "Each result must include a 'message' with a 'text' field, 'locations', and a 'ruleId'. The 'ruleId' should be a short, descriptive string for the issue type (e.g., 'sql-injection', 'insecure-deserialization'). "
+                  "If no issues are found, return a valid SARIF log with an empty 'results' array. "
+                  "Do not include any text, explanation, or markdown formatting before or after the JSON object. "
+                  f"The analysis is for the file located at: '{file_path}'.\n\n"
+                  "```code\n"
+                  f"{file_content}\n"
+                  "```"
+              )
+
+          def clean_response(text):
+              """Cleans the API response to extract the JSON object, removing markdown wrappers."""
+              # Look for a JSON block wrapped in ```json ... ```
+              match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+              if match:
+                  return match.group(1)
+              # Fallback for cases where the LLM just returns a raw JSON object
+              if text.strip().startswith('{'):
+                  return text.strip()
+              return None
+
+          def main():
+              if not API_KEY:
+                  print("Error: GOOGLE_API_KEY secret not found. Please add it to your repository secrets.", file=sys.stderr)
+                  sys.exit(1)
+
+              all_results = []
+              all_rules = {}
+
+              print("Starting Gemini code analysis...")
+              for root, _, files in os.walk("."):
+                  if should_ignore(root):
+                      continue
+                  for file in files:
+                      file_path = os.path.join(root, file)
+                      if should_ignore(file_path) or not any(file.endswith(ext) for ext in FILE_EXTENSIONS_TO_ANALYZE):
+                          continue
+
+                      print(f"Analyzing file: {file_path}")
+                      try:
+                          with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                              content = f.read()
+
+                          if not content.strip():
+                              print(f"Skipping empty file: {file_path}")
+                              continue
+
+                          prompt = create_prompt(file_path, content)
+                          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+                          headers = {'Content-Type': 'application/json'}
+
+                          # Implement exponential backoff for API calls
+                          retries = 3
+                          backoff_factor = 2
+                          for i in range(retries):
+                              try:
+                                  response = requests.post(API_URL, json=payload, headers=headers, timeout=60)
+                                  response.raise_for_status()
+                                  
+                                  response_data = response.json()
+                                  if 'candidates' not in response_data or not response_data['candidates']:
+                                      print(f"Warning: Gemini API returned no candidates for {file_path}. Response: {response_data}")
+                                      # This could be a safety block, treat as no issues found
+                                      break 
+
+                                  response_text = response_data['candidates'][0]['content']['parts'][0]['text']
+                                  cleaned_json_str = clean_response(response_text)
+
+                                  if not cleaned_json_str:
+                                      print(f"Warning: Could not extract valid JSON from Gemini response for {file_path}.")
+                                      break
+
+                                  gemini_sarif = json.loads(cleaned_json_str)
+
+                                  # Extract results and rules from the response
+                                  if 'runs' in gemini_sarif and gemini_sarif['runs']:
+                                      run = gemini_sarif['runs'][0]
+                                      if 'results' in run:
+                                          # IMPORTANT: Update location URI to be relative to the repo root for GitHub integration
+                                          for result in run['results']:
+                                              for location in result.get('locations', []):
+                                                  if 'physicalLocation' in location and 'artifactLocation' in location['physicalLocation']:
+                                                      location['physicalLocation']['artifactLocation']['uri'] = file_path.lstrip('./')
+                                          all_results.extend(run['results'])
+
+                                      # Aggregate rules, avoiding duplicates
+                                      if 'tool' in run and 'driver' in run['tool'] and 'rules' in run['tool']['driver']:
+                                          for rule in run['tool']['driver']['rules']:
+                                              if rule['id'] not in all_rules:
+                                                  all_rules[rule['id']] = rule
+                                  break # Success, exit retry loop
+                              except requests.exceptions.RequestException as e:
+                                  if i < retries - 1:
+                                      wait_time = backoff_factor ** i
+                                      print(f"API request failed for {file_path}, retrying in {wait_time}s... ({e})")
+                                      time.sleep(wait_time)
+                                  else:
+                                      print(f"Error: Final API request failed for {file_path}: {e}", file=sys.stderr)
+                                      raise
+                      
+                      except json.JSONDecodeError as e:
+                          print(f"Error decoding JSON from Gemini response for {file_path}: {e}", file=sys.stderr)
+                          print(f"Raw response was: {cleaned_json_str}", file=sys.stderr)
+                      except Exception as e:
+                          print(f"An unexpected error occurred for file {file_path}: {e}", file=sys.stderr)
+
+              # Populate the final SARIF log with all aggregated results and rules
+              sarif_log['runs'][0]['results'] = all_results
+              sarif_log['runs'][0]['tool']['driver']['rules'] = list(all_rules.values())
+
+              output_path = 'gemini-analysis.sarif'
+              with open(output_path, 'w') as f:
+                  json.dump(sarif_log, f, indent=2)
+
+              print(f"Analysis complete. SARIF report generated at {output_path} with {len(all_results)} total results.")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          # Make the script executable and run it
+          python analyze.py
+
+      # 5. Upload the generated SARIF file to GitHub's security tab
+      - name: Upload SARIF file
+        # Use 'if: always()' to ensure this step runs even if the analysis script fails,
+        # allowing for partial results to be uploaded.
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          # Path to the SARIF file relative to the repository root
+          sarif_file: gemini-analysis.sarif
+          # A category for the analysis to distinguish it from other tools
+          category: gemini-static-analysis
